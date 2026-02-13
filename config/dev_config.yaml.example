@@ -1,0 +1,16 @@
+database:
+  db_uri: mysql+pymysql://username:password@localhost:3306/database_name
+
+virtual_server:
+  host: 0.0.0.0
+  port: 5000
+
+api_endpoints:
+  stay_times: "http://your-server-ip:5000/wandikweza/stay_times"
+  patient_data: "http://your-server-ip:5000/wandikweza/get_patient_data"
+  fetch_interval: 60
+  adaptive_intervals:
+    enabled: true
+    min_interval: 60      # Minimum interval when data is changing
+    max_interval: 300     # Maximum interval when no changes detected
+    backoff_multiplier: 1.5
