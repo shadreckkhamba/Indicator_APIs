@@ -26,3 +26,8 @@ functions
 playground
 logs
 logs/*
+# ignore utility and migration files
+cleanup_calculated_fields.py
+production_migration.py
+metrics_sql.sql
+scripts/seed_patient_stay_times.py
