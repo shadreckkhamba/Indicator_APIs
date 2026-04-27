@@ -1,3 +1,15 @@
+app:
+  SECRET_KEY: ${FLASK_SECRET_KEY}
+  TRUST_PROXY_HEADERS: false
+
+security:
+  require_api_key: false
+  api_key: ${VIRTUAL_SERVER_API_KEY}
+  api_key_header: X-API-Key
+  enforce_https: false
+  exempt_paths:
+    - /rr/health/
+
 database:
   db_uri: mysql+pymysql://username:password@localhost:3306/database_name
 

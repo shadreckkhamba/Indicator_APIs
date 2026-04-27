@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 import gzip
 import io
+import math
 from services.patient_categories_service import save_patient_data_upsert
 from models.last_update_status_model import LastUpdateStatus
 from extensions.extensions import db
@@ -12,11 +13,15 @@ from sqlalchemy import text, func
 from flask import jsonify
 from datetime import datetime, timedelta
 from models.patient_stay_time_model import PatientStayTime
+from models.patient_age_category_model import PatientAgeCategory
+from models.patient_gender_count_model import PatientGenderCount
+from models.patient_location_count_model import PatientLocationCount
+from models.patient_refund_count_model import PatientRefundCount
 
 DAYS_TO_FETCH = 7
 RECENT_RECORDS_COUNT = 10
 STAY_DISTRIBUTION_MAX_HOURS = 10.0
-STAY_DISTRIBUTION_BUCKET_MINUTES = 10
+STAY_DISTRIBUTION_BUCKET_MINUTES = 1
 
 
 wandikweza_bp = Blueprint('wandikweza', __name__)
@@ -135,7 +140,7 @@ def get_daily_average_stay():
         # Group records by date and sort by departure time
         daily_data = {}
         for record in all_records:
-            date_str = record.arrival_time.date().strftime("%Y-%m-%d")
+            date_str = record.push_time.date().strftime("%Y-%m-%d")
             if date_str not in daily_data:
                 daily_data[date_str] = []
             daily_data[date_str].append({
@@ -249,7 +254,7 @@ def get_daily_average_stay():
         # Build stay distribution per day
         stay_distribution = {}
         for record in all_records:
-            if record.difference_hours is None or record.arrival_time is None:
+            if record.difference_hours is None or record.push_time is None:
                 continue
             try:
                 hours = float(record.difference_hours)
@@ -258,7 +263,7 @@ def get_daily_average_stay():
             if hours < 0 or hours >= STAY_DISTRIBUTION_MAX_HOURS:
                 continue
 
-            date_key = record.arrival_time.date().strftime("%Y-%m-%d")
+            date_key = record.push_time.date().strftime("%Y-%m-%d")
             if date_key not in stay_distribution:
                 stay_distribution[date_key] = [0] * bucket_count
 
@@ -296,27 +301,72 @@ def get_daily_average_stay():
 def stay_times_distribution():
     """
     Returns a list of stay time entries formatted as HH:MM:SS plus
-    shortest and longest stay in decimal hours. Supports `period` query
-    param: 'day' | 'week' | 'month' (defaults to 'day').
+    shortest and longest stay in decimal hours.
+
+    Supports:
+    - period=day|week|month (defaults to day)
+    - date=YYYY-MM-DD for a single-day snapshot
+    - start_date=YYYY-MM-DD and end_date=YYYY-MM-DD for an inclusive range
     """
     try:
         period = (request.args.get('period') or 'day').lower()
+        date_str = request.args.get('date')
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
         now = datetime.now()
+        start = None
+        end_exclusive = None
 
-        if period == 'day':
+        if date_str:
+            try:
+                target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return jsonify({
+                    'error': 'Invalid date format. Use YYYY-MM-DD for date.'
+                }), 400
+            start = datetime.combine(target_date, datetime.min.time())
+            end_exclusive = start + timedelta(days=1)
+        elif start_date_str or end_date_str:
+            if not start_date_str or not end_date_str:
+                return jsonify({
+                    'error': 'Both start_date and end_date are required when filtering by range.'
+                }), 400
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return jsonify({
+                    'error': 'Invalid date format. Use YYYY-MM-DD for start_date and end_date.'
+                }), 400
+            if end_date < start_date:
+                return jsonify({
+                    'error': 'end_date must be greater than or equal to start_date.'
+                }), 400
+            start = datetime.combine(start_date, datetime.min.time())
+            end_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+        elif period == 'day':
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_exclusive = start + timedelta(days=1)
         elif period == 'week':
-            start = now - timedelta(days=7)
+            start = (now - timedelta(days=now.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            end_exclusive = start + timedelta(days=7)
         elif period == 'month':
-            start = now - timedelta(days=30)
+            start = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0))
+            if now.month == 12:
+                end_exclusive = datetime(now.year + 1, 1, 1)
+            else:
+                end_exclusive = datetime(now.year, now.month + 1, 1)
         else:
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_exclusive = start + timedelta(days=1)
 
-        records = (
-            db.session.query(PatientStayTime)
-            .filter(PatientStayTime.arrival_time >= start)
-            .all()
-        )
+        query = db.session.query(PatientStayTime).filter(PatientStayTime.push_time >= start)
+        if end_exclusive is not None:
+            query = query.filter(PatientStayTime.push_time < end_exclusive)
+
+        records = query.all()
 
         entries = []
         shortest = None
@@ -359,7 +409,8 @@ def stay_times_distribution():
             "longest_stay": round(longest, 2) if longest is not None else None,
         }
 
-        logger.info(f"/stay_times_distribution: period={period} entries={len(entries)} shortest={response['shortest_stay']} longest={response['longest_stay']}")
+        filter_desc = date_str or (f"{start_date_str}..{end_date_str}" if start_date_str or end_date_str else period)
+        logger.info(f"/stay_times_distribution: filter={filter_desc} entries={len(entries)} shortest={response['shortest_stay']} longest={response['longest_stay']}")
         return jsonify(response), 200
 
     except Exception as e:
@@ -370,31 +421,72 @@ def stay_times_distribution():
 @wandikweza_bp.route('/stay_times_trend', methods=['GET'])
 def stay_times_trend():
     """
-    Returns daily aggregated stay time trend data for the past 7 days.
+    Returns daily aggregated stay time trend data.
+    Optional query params:
+    - start_date=YYYY-MM-DD
+    - end_date=YYYY-MM-DD
+    If omitted, defaults to the last 7 days.
     Each entry contains: day (YYYY-MM-DD), avg_stay_hours, total_patients
     """
     try:
-        now = datetime.now()
-        start = now - timedelta(days=7)
+        start_date_str = request.args.get("start_date")
+        end_date_str = request.args.get("end_date")
+
+        if start_date_str or end_date_str:
+            if not start_date_str or not end_date_str:
+                return jsonify({
+                    "error": "Both start_date and end_date are required when filtering by week."
+                }), 400
+            try:
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                return jsonify({
+                    "error": "Invalid date format. Use YYYY-MM-DD for start_date and end_date."
+                }), 400
+
+            if end_date < start_date:
+                return jsonify({
+                    "error": "end_date must be greater than or equal to start_date."
+                }), 400
+
+            start_dt = datetime.combine(start_date, datetime.min.time())
+            end_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+        else:
+            now = datetime.now()
+            start_dt = now - timedelta(days=7)
+            end_exclusive = now
 
         records = (
             db.session.query(PatientStayTime)
-            .filter(PatientStayTime.arrival_time >= start)
+            .filter(PatientStayTime.push_time >= start_dt)
+            .filter(PatientStayTime.push_time < end_exclusive)
             .all()
         )
 
         # Group by date
         daily_data = {}
         for r in records:
-            if r.arrival_time is None or r.difference_hours is None:
+            if r.push_time is None or r.difference_hours is None:
                 continue
 
-            date_str = r.arrival_time.date().strftime("%Y-%m-%d")
+            try:
+                if isinstance(r.push_time, datetime):
+                    day_value = r.push_time.date()
+                else:
+                    day_value = datetime.fromisoformat(str(r.push_time)).date()
+                date_str = day_value.strftime("%Y-%m-%d")
+            except Exception:
+                # Skip malformed timestamps instead of failing the entire request
+                continue
+
             if date_str not in daily_data:
                 daily_data[date_str] = {'hours': [], 'count': 0}
 
             try:
                 hours = float(r.difference_hours)
+                if not math.isfinite(hours):
+                    continue
                 daily_data[date_str]['hours'].append(hours)
                 daily_data[date_str]['count'] += 1
             except (TypeError, ValueError):
@@ -413,9 +505,183 @@ def stay_times_trend():
                 })
 
         response = {"entries": entries}
-        logger.info(f"/stay_times_trend: returned {len(entries)} days of data")
+        logger.info(
+            f"/stay_times_trend: returned {len(entries)} days of data "
+            f"for range {start_dt.isoformat()} to {end_exclusive.isoformat()} (exclusive end)"
+        )
         return jsonify(response), 200
 
     except Exception as e:
         logger.exception("Error in /stay_times_trend")
+        return jsonify({"error": str(e)}), 500
+
+
+@wandikweza_bp.route('/patient_records', methods=['GET'])
+def get_patient_records():
+    """
+    Returns individual patient records with patient_id, arrival_time, and departure_time.
+    Optional query params:
+    - period: 'day' | 'week' | 'month' | 'all' (defaults to 'month')
+    - limit: max number of records to return (defaults to 100)
+    - offset: pagination offset (defaults to 0)
+    """
+    try:
+        period = (request.args.get('period') or 'month').lower()
+        limit = int(request.args.get('limit', 100))
+        offset = int(request.args.get('offset', 0))
+
+        now = datetime.now()
+        
+        # Build query based on period
+        query = db.session.query(PatientStayTime)
+        
+        if period == 'day':
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            query = query.filter(PatientStayTime.push_time >= start)
+        elif period == 'week':
+            start = now - timedelta(days=7)
+            query = query.filter(PatientStayTime.push_time >= start)
+        elif period == 'month':
+            start = now - timedelta(days=30)
+            query = query.filter(PatientStayTime.push_time >= start)
+        elif period == 'all':
+            # No date filter for 'all'
+            pass
+        else:
+            # Default to month if invalid period
+            start = now - timedelta(days=30)
+            query = query.filter(PatientStayTime.push_time >= start)
+
+        # Order by arrival time (most recent first)
+        query = query.order_by(PatientStayTime.arrival_time.desc())
+
+        total_count = query.count()
+        records = query.limit(limit).offset(offset).all()
+
+        patients = []
+        for r in records:
+            patients.append({
+                "patient_id": r.patient_id,
+                "arrival_time": r.arrival_time.isoformat() if r.arrival_time else None,
+                "departure_time": r.departure_time.isoformat() if r.departure_time else None
+            })
+
+        response = {
+            "patients": patients,
+            "total_count": total_count,
+            "limit": limit,
+            "offset": offset,
+            "period": period
+        }
+
+        logger.info(f"/patient_records: period={period} returned {len(patients)} records (total={total_count})")
+        return jsonify(response), 200
+
+    except Exception as e:
+        logger.exception("Error in /patient_records")
+        return jsonify({"error": str(e)}), 500
+
+
+@wandikweza_bp.route('/date_ranges', methods=['GET'])
+def get_date_ranges():
+    """
+    Returns dynamic date ranges for each table based on actual data.
+    For each table, returns the first day of the month to the last day data was created.
+    
+    Response format:
+    {
+        "patient_age_categories": {
+            "start_date": "2026-04-01",
+            "end_date": "2026-04-08",
+            "table_name": "patient_age_categories",
+            "date_field": "time_stamp"
+        },
+        ...
+    }
+    """
+    try:
+        ranges = {}
+        
+        # Define table configurations with their models and date fields
+        table_configs = [
+            {
+                'key': 'patient_age_categories',
+                'model': PatientAgeCategory,
+                'date_field': 'time_stamp',
+                'table_name': 'patient_age_categories'
+            },
+            {
+                'key': 'patient_gender_counts', 
+                'model': PatientGenderCount,
+                'date_field': 'time_stamp',
+                'table_name': 'patient_gender_counts'
+            },
+            {
+                'key': 'patient_location_counts',
+                'model': PatientLocationCount, 
+                'date_field': 'time_stamp',
+                'table_name': 'patient_location_counts'
+            },
+            {
+                'key': 'patient_refund_count',
+                'model': PatientRefundCount,
+                'date_field': 'refund_timestamp', 
+                'table_name': 'patient_refund_count'
+            },
+            {
+                'key': 'patient_stay_times',
+                'model': PatientStayTime,
+                'date_field': 'push_time',
+                'table_name': 'patient_stay_times'
+            }
+        ]
+        
+        for config in table_configs:
+            try:
+                model = config['model']
+                date_field = getattr(model, config['date_field'])
+                
+                # Get the latest date from the table
+                latest_record = db.session.query(func.max(date_field)).scalar()
+                
+                if latest_record:
+                    # Convert to date if it's a datetime
+                    if hasattr(latest_record, 'date'):
+                        end_date = latest_record.date()
+                    else:
+                        end_date = latest_record
+                    
+                    # Start date is first day of the month
+                    start_date = end_date.replace(day=1)
+                    
+                    ranges[config['key']] = {
+                        'start_date': start_date.strftime('%Y-%m-%d'),
+                        'end_date': end_date.strftime('%Y-%m-%d'),
+                        'table_name': config['table_name'],
+                        'date_field': config['date_field']
+                    }
+                else:
+                    # No data in table
+                    ranges[config['key']] = {
+                        'start_date': None,
+                        'end_date': None,
+                        'table_name': config['table_name'],
+                        'date_field': config['date_field']
+                    }
+                    
+            except Exception as e:
+                logger.warning(f"Error getting date range for {config['key']}: {str(e)}")
+                ranges[config['key']] = {
+                    'start_date': None,
+                    'end_date': None,
+                    'table_name': config['table_name'],
+                    'date_field': config['date_field'],
+                    'error': str(e)
+                }
+        
+        logger.info(f"/date_ranges: returned ranges for {len(ranges)} tables")
+        return jsonify(ranges), 200
+        
+    except Exception as e:
+        logger.exception("Error in /date_ranges")
         return jsonify({"error": str(e)}), 500

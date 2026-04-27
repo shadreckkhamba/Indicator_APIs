@@ -8,7 +8,6 @@ from models.patient_refund_count_model import PatientRefundCount
 from sqlalchemy.exc import IntegrityError
 from models.patient_location_count_model import PatientLocationCount
 from sqlalchemy.dialects.mysql import insert
-from sqlalchemy import func
 
 def upsert_patient_age_category(patient_id, category, time_stamp, total):
     stmt = insert(PatientAgeCategory).values(
@@ -62,7 +61,7 @@ def upsert_patient_gender_count(patient_id, gender, time_stamp, total):
 
 # Insert or Update refund counts
 def upsert_patient_refund_count(patient_id, refund_timestamp, count, total):
-    try:        
+    try:
         obj = db.session.query(PatientRefundCount).filter_by(
             patient_id=patient_id,
             refund_timestamp=refund_timestamp
@@ -235,8 +234,10 @@ def save_patient_data_upsert(data):
                     updated_at=current_date
                 )
                 stmt = stmt.on_duplicate_key_update(
-                    total=PatientRefundCount.total + count,
-                    count=PatientRefundCount.count + count,
+                    # Idempotent upsert: if the source re-sends the same refund
+                    # record, do not keep incrementing counts.
+                    total=stmt.inserted.total,
+                    count=stmt.inserted.count,
                     updated_at=current_date
                 )
                 db.session.execute(stmt)
@@ -268,8 +269,8 @@ def save_patient_data_upsert(data):
         db.session.commit()
         logger.info("Patient data upserted successfully")
 
-        # Update last_updated timestamp
-        update_last_updated_if_needed()
+        # Dashboard freshness should reflect receipt time, not event timestamps.
+        update_last_update_status(current_date)
 
         return {"message": "Patient data saved successfully"}
 
@@ -277,31 +278,3 @@ def save_patient_data_upsert(data):
         logger.exception("Error saving patient data")
         db.session.rollback()
         return {"error": "Internal server error"}
- 
-# Update the last updated timestamp
-def update_last_updated_if_needed():
-
-    latest_age = db.session.query(func.max(PatientAgeCategory.created_at)).scalar()
-    latest_gender = db.session.query(func.max(PatientGenderCount.created_at)).scalar()
-    latest_refund = db.session.query(func.max(PatientRefundCount.created_at)).scalar()
-    latest_location = db.session.query(func.max(PatientLocationCount.created_at)).scalar()
-
-    latest_times = [t for t in [latest_age, latest_gender, latest_refund, latest_location] if t]
-
-    if not latest_times:
-        logger.info("No data in any table, skipping last update status.")
-        return
-
-    most_recent = max(latest_times)
-
-    record = db.session.query(LastUpdateStatus).first()
-    if not record:
-        db.session.add(LastUpdateStatus(last_updated=most_recent))
-        logger.info(f"Created new last_update_status with {most_recent}")
-    elif most_recent > record.last_updated:
-        record.last_updated = most_recent
-        logger.info(f"Updated last_update_status to {most_recent}")
-    else:
-        logger.info(f"No new data detected. last_update_status remains at {record.last_updated}")
-
-    db.session.commit()
